@@ -17,14 +17,17 @@
 package com.android.webview.chromium;
 
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Picture;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.net.Uri;
 import android.net.http.SslCertificate;
 import android.os.Build;
 import android.os.Bundle;
@@ -36,6 +39,7 @@ import android.util.Base64;
 import android.util.Log;
 import android.view.HardwareCanvas;
 import android.view.KeyEvent;
+import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.View.MeasureSpec;
@@ -54,11 +58,14 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebViewFactory;
 import android.webkit.WebViewProvider;
+import android.webkit.WebChromeClient.CustomViewCallback;
 import android.widget.TextView;
 
 import org.chromium.android_webview.AwBrowserContext;
 import org.chromium.android_webview.AwContents;
+import org.chromium.android_webview.AwContentsStatics;
 import org.chromium.android_webview.AwLayoutSizer;
 import org.chromium.android_webview.AwSettings;
 import org.chromium.android_webview.AwPrintDocumentAdapter;
@@ -144,6 +151,11 @@ class WebViewChromium implements WebViewProvider,
 
     private WebViewChromiumFactoryProvider mFactory;
 
+    private static boolean sRecordWholeDocumentEnabledByApi = false;
+    static void enableSlowWholeDocumentDraw() {
+        sRecordWholeDocumentEnabledByApi = true;
+    }
+
     // This does not touch any global / non-threadsafe state, but note that
     // init is ofter called right after and is NOT threadsafe.
     public WebViewChromium(WebViewChromiumFactoryProvider factory, WebView webView,
@@ -154,6 +166,8 @@ class WebViewChromium implements WebViewProvider,
         mAppTargetSdkVersion = mWebView.getContext().getApplicationInfo().targetSdkVersion;
         mFactory = factory;
         mRunQueue = new WebViewChromiumRunQueue();
+        String webViewAssetPath = WebViewFactory.getLoadedPackageInfo().applicationInfo.sourceDir;
+        mWebView.getContext().getAssets().addAssetPath(webViewAssetPath);
     }
 
     static void completeWindowCreation(WebView parent, WebView child) {
@@ -235,6 +249,13 @@ class WebViewChromium implements WebViewProvider,
                 mWebView.getContext(), isAccessFromFileURLsGrantedByDefault,
                 areLegacyQuirksEnabled));
 
+        if (mAppTargetSdkVersion <= Build.VERSION_CODES.KITKAT) {
+            mWebSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+            // On KK and older versions we always allowed third party cookies.
+            mWebSettings.setAcceptThirdPartyCookies(true);
+            mWebSettings.getAwSettings().setZeroLayoutHeightDisablesViewportQuirk(true);
+        }
+
         mRunQueue.addTask(new Runnable() {
                 @Override
                 public void run() {
@@ -250,8 +271,42 @@ class WebViewChromium implements WebViewProvider,
         });
     }
 
+    // Wrap Context so that we can use resources from the webview resource apk.
+    private static Context resourcesContextWrapper(final Context ctx) {
+        return new ContextWrapper(ctx) {
+            @Override
+            public ClassLoader getClassLoader() {
+                final ClassLoader appCl = getBaseContext().getClassLoader();
+                final ClassLoader webViewCl = this.getClass().getClassLoader();
+                return new ClassLoader() {
+                    @Override
+                    protected Class<?> findClass(String name) throws ClassNotFoundException {
+                        // First look in the WebViewProvider class loader.
+                        try {
+                            return webViewCl.loadClass(name);
+                        } catch (ClassNotFoundException e) {
+                            // Look in the app class loader; allowing it to throw ClassNotFoundException.
+                            return appCl.loadClass(name);
+                        }
+                    }
+                };
+            }
+
+            @Override
+            public Object getSystemService(String name) {
+                if (name.equals(Context.LAYOUT_INFLATER_SERVICE)) {
+                    LayoutInflater i = (LayoutInflater) getBaseContext().getSystemService(name);
+                    return i.cloneInContext(this);
+                } else {
+                    return getBaseContext().getSystemService(name);
+                }
+            }
+
+        };
+    }
+
     private void initForReal() {
-        Context ctx = ResourcesContextWrapperFactory.get(mWebView.getContext());
+        Context ctx = resourcesContextWrapper(mWebView.getContext());
         mAwContents = new AwContents(mFactory.getBrowserContext(), mWebView, ctx,
                 new InternalAccessAdapter(), new WebViewNativeGLDelegate(),
                 mContentsClientAdapter, mWebSettings.getAwSettings());
@@ -260,6 +315,15 @@ class WebViewChromium implements WebViewProvider,
             // On KK and above, favicons are automatically downloaded as the method
             // old apps use to enable that behavior is deprecated.
             AwContents.setShouldDownloadFavicons();
+        }
+
+        AwContentsStatics.setRecordFullDocument(sRecordWholeDocumentEnabledByApi ||
+                mAppTargetSdkVersion < Build.VERSION_CODES.L);
+
+        if (mAppTargetSdkVersion <= Build.VERSION_CODES.KITKAT) {
+            // On KK and older versions, JavaScript objects injected via addJavascriptInterface
+            // were not inspectable.
+            mAwContents.disableJavascriptInterfacesInspection();
         }
 
         // TODO: This assumes AwContents ignores second Paint param.
@@ -1269,7 +1333,41 @@ class WebViewChromium implements WebViewProvider,
 
     @Override
     public void setWebChromeClient(WebChromeClient client) {
+        mWebSettings.getAwSettings().setFullscreenSupported(doesSupportFullscreen(client));
         mContentsClientAdapter.setWebChromeClient(client);
+    }
+
+    /**
+     * Returns true if the supplied {@link WebChromeClient} supports fullscreen.
+     *
+     * <p>For fullscreen support, implementations of {@link WebChromeClient#onShowCustomView}
+     * and {@link WebChromeClient#onHideCustomView()} are required.
+     */
+    private boolean doesSupportFullscreen(WebChromeClient client) {
+        if (client == null) {
+            return false;
+        }
+        Class<?> clientClass = client.getClass();
+        boolean foundShowMethod = false;
+        boolean foundHideMethod = false;
+        while (clientClass != WebChromeClient.class && (!foundShowMethod || !foundHideMethod)) {
+            if (!foundShowMethod) {
+                try {
+                    clientClass.getDeclaredMethod("onShowCustomView", View.class,
+                            CustomViewCallback.class);
+                    foundShowMethod = true;
+                } catch (NoSuchMethodException e) { }
+            }
+
+            if (!foundHideMethod) {
+                try {
+                    clientClass.getDeclaredMethod("onHideCustomView");
+                    foundHideMethod = true;
+                } catch (NoSuchMethodException e) { }
+            }
+            clientClass = clientClass.getSuperclass();
+        }
+        return foundShowMethod && foundHideMethod;
     }
 
     @Override
@@ -1401,6 +1499,14 @@ class WebViewChromium implements WebViewProvider,
             return ret;
         }
         return mAwContents.zoomOut();
+    }
+
+    @Override
+    public boolean zoomBy(float factor) {
+        mFactory.startYourEngines(true);
+        // This is an L API and therefore we can enforce stricter threading constraints.
+        checkThread();
+        return mAwContents.zoomBy(factor);
     }
 
     @Override
@@ -1931,10 +2037,12 @@ class WebViewChromium implements WebViewProvider,
         // we won't need it again.
     }
 
-    @Override
-    public PrintDocumentAdapter createPrintDocumentAdapter() {
-        checkThread();
-        return new AwPrintDocumentAdapter(mAwContents.getPdfExporter());
+    public void onStartTemporaryDetach() {
+        mAwContents.onStartTemporaryDetach();
+    }
+
+    public void onFinishTemporaryDetach() {
+        mAwContents.onFinishTemporaryDetach();
     }
 
     // WebViewProvider.ScrollDelegate implementation ----------------------------------------------
@@ -2029,34 +2137,27 @@ class WebViewChromium implements WebViewProvider,
         mAwContents.computeScroll();
     }
 
+    // TODO(sgurun) this is only to have master-gpl compiling.
+    public PrintDocumentAdapter createPrintDocumentAdapter() {
+         return createPrintDocumentAdapter("default");
+    }
+
+    //@Override TODO(sgurun) commenting this out to have master-gpl compiling.
+    public PrintDocumentAdapter createPrintDocumentAdapter(String documentName) {
+        checkThread();
+        return new AwPrintDocumentAdapter(mAwContents.getPdfExporter(), documentName);
+    }
+
     // AwContents.NativeGLDelegate implementation --------------------------------------
     private class WebViewNativeGLDelegate implements AwContents.NativeGLDelegate {
-        public boolean requestDrawGL(Canvas canvas) {
-            return requestDrawGL(canvas, false, mWebView);
-        }
-
-        // @Override
+        @Override
         public boolean requestDrawGL(Canvas canvas, boolean waitForCompletion,
                 View containerView) {
             if (mGLfunctor == null) {
                 mGLfunctor = new DrawGLFunctor(mAwContents.getAwDrawGLViewContext());
             }
-            boolean result = mGLfunctor.requestDrawGL((HardwareCanvas)canvas,
-                    containerView.getViewRootImpl());
-            if (result && waitForCompletion) {
-                Runnable r = new Runnable() {
-                    @Override
-                    public void run() {
-                    }
-                };
-                result =  containerView.executeHardwareAction(r);
-            }
-            return result;
-        }
-
-        // @Override
-        public boolean executeHardwareAction(Runnable action) {
-            return mWebView.executeHardwareAction(action);
+            return mGLfunctor.requestDrawGL(
+                    (HardwareCanvas) canvas, containerView.getViewRootImpl(), waitForCompletion);
         }
 
         @Override
@@ -2146,6 +2247,11 @@ class WebViewChromium implements WebViewProvider,
         @Override
         public void setMeasuredDimension(int measuredWidth, int measuredHeight) {
             mWebViewPrivate.setMeasuredDimension(measuredWidth, measuredHeight);
+        }
+
+        // @Override
+        public boolean super_onHoverEvent(MotionEvent event) {
+            return mWebViewPrivate.super_onHoverEvent(event);
         }
     }
 }
