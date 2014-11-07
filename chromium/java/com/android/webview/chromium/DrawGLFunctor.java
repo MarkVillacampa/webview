@@ -16,7 +16,6 @@
 
 package com.android.webview.chromium;
 
-import android.view.DisplayList;
 import android.view.HardwareCanvas;
 import android.view.ViewRootImpl;
 import android.util.Log;
@@ -42,6 +41,7 @@ class DrawGLFunctor {
     }
 
     public void destroy() {
+        detach();
         if (mCleanupReference != null) {
             mCleanupReference.cleanupNow();
             mCleanupReference = null;
@@ -53,19 +53,26 @@ class DrawGLFunctor {
         mDestroyRunnable.detachNativeFunctor();
     }
 
-    public boolean requestDrawGL(HardwareCanvas canvas, ViewRootImpl viewRootImpl) {
+    public boolean requestDrawGL(HardwareCanvas canvas, ViewRootImpl viewRootImpl,
+            boolean waitForCompletion) {
         if (mDestroyRunnable.mNativeDrawGLFunctor == 0) {
             throw new RuntimeException("requested DrawGL on already destroyed DrawGLFunctor");
         }
+        if (viewRootImpl == null) {
+            // Can happen during teardown when window is leaked.
+            return false;
+        }
+
         mDestroyRunnable.mViewRootImpl = viewRootImpl;
-        if (canvas != null) {
-            int ret = canvas.callDrawGLFunction(mDestroyRunnable.mNativeDrawGLFunctor);
-            if (ret != DisplayList.STATUS_DONE) {
-                Log.e(TAG, "callDrawGLFunction error: " + ret);
-                return false;
-            }
-        } else {
-            viewRootImpl.attachFunctor(mDestroyRunnable.mNativeDrawGLFunctor);
+        if (canvas == null) {
+            viewRootImpl.invokeFunctor(mDestroyRunnable.mNativeDrawGLFunctor, waitForCompletion);
+            return true;
+        }
+
+        canvas.callDrawGLFunction(mDestroyRunnable.mNativeDrawGLFunctor);
+        if (waitForCompletion) {
+            viewRootImpl.invokeFunctor(mDestroyRunnable.mNativeDrawGLFunctor,
+                    waitForCompletion);
         }
         return true;
     }

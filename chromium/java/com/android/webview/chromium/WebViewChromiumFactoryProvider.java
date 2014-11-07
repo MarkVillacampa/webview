@@ -22,11 +22,14 @@ import android.app.ActivityManager;
 import android.app.ActivityThread;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
-import android.content.res.Resources;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Looper;
+import android.os.StrictMode;
+import android.os.SystemProperties;
+import android.os.Trace;
 import android.util.Log;
 import android.webkit.CookieManager;
 import android.webkit.GeolocationPermissions;
@@ -41,6 +44,7 @@ import android.webkit.WebViewProvider;
 import org.chromium.android_webview.AwBrowserContext;
 import org.chromium.android_webview.AwBrowserProcess;
 import org.chromium.android_webview.AwContents;
+import org.chromium.android_webview.AwContentsStatics;
 import org.chromium.android_webview.AwCookieManager;
 import org.chromium.android_webview.AwDevToolsServer;
 import org.chromium.android_webview.AwFormDatabase;
@@ -51,21 +55,25 @@ import org.chromium.android_webview.AwSettings;
 import org.chromium.base.CommandLine;
 import org.chromium.base.MemoryPressureListener;
 import org.chromium.base.PathService;
+import org.chromium.base.PathUtils;
 import org.chromium.base.ResourceExtractor;
 import org.chromium.base.ThreadUtils;
+import org.chromium.base.TraceEvent;
 import org.chromium.base.library_loader.LibraryLoader;
 import org.chromium.base.library_loader.ProcessInitException;
 import org.chromium.content.app.ContentMain;
 import org.chromium.content.browser.ContentViewStatics;
 
+import java.io.File;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 
 public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
 
-    private final String TAG = "WebViewChromiumFactoryProvider";
+    private static final String TAG = "WebViewChromiumFactoryProvider";
 
     private static final String CHROMIUM_PREFS_NAME = "WebViewChromiumPrefs";
+    private static final String VERSION_CODE_PREF = "lastVersionCodeUsed";
     private static final String COMMAND_LINE_FILE = "/data/local/tmp/webview-command-line";
 
     // Guards accees to the other members, and is notifyAll() signalled on the UI thread
@@ -88,37 +96,89 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
     // Read/write protected by mLock.
     private boolean mStarted;
 
+    private SharedPreferences mWebViewPrefs;
+
     public WebViewChromiumFactoryProvider() {
-        if (Build.IS_DEBUGGABLE) {
+        if (isBuildDebuggable()) {
+            // Suppress the StrictMode violation as this codepath is only hit on debugglable builds.
+            StrictMode.ThreadPolicy oldPolicy = StrictMode.allowThreadDiskReads();
             CommandLine.initFromFile(COMMAND_LINE_FILE);
+            StrictMode.setThreadPolicy(oldPolicy);
         } else {
             CommandLine.init(null);
         }
 
         CommandLine cl = CommandLine.getInstance();
-
-        // Hardware acceleration in chromium m37+ no longer works with android Kitkat, so force
-        // disable hardware acceleration. This is for AOSP only until L is open sourced.
-        cl.appendSwitch("force-auxiliary-bitmap");
-
         // TODO: currently in a relase build the DCHECKs only log. We either need to insall
         // a report handler with SetLogReportHandler to make them assert, or else compile
         // them out of the build altogether (b/8284203). Either way, so long they're
         // compiled in, we may as unconditionally enable them here.
         cl.appendSwitch("enable-dcheck");
 
-
+        ThreadUtils.setWillOverrideUiThread();
         // Load chromium library.
+        Trace.traceBegin(Trace.TRACE_TAG_WEBVIEW, "AwBrowserProcess.loadLibrary()");
         AwBrowserProcess.loadLibrary();
+        Trace.traceEnd(Trace.TRACE_TAG_WEBVIEW);
         // Load glue-layer support library.
         System.loadLibrary("webviewchromium_plat_support");
-        ThreadUtils.setWillOverrideUiThread();
+
+        // Use shared preference to check for package downgrade.
+        mWebViewPrefs = ActivityThread.currentApplication().getSharedPreferences(
+                            CHROMIUM_PREFS_NAME, Context.MODE_PRIVATE);
+        int lastVersion = mWebViewPrefs.getInt(VERSION_CODE_PREF, 0);
+        int currentVersion = WebViewFactory.getLoadedPackageInfo().versionCode;
+        if (lastVersion > currentVersion) {
+            // The WebView package has been downgraded since we last ran in this application.
+            // Delete the WebView data directory's contents.
+            String dataDir = PathUtils.getDataDirectory(ActivityThread.currentApplication());
+            Log.i(TAG, "WebView package downgraded from " + lastVersion + " to " + currentVersion +
+                       "; deleting contents of " + dataDir);
+            deleteContents(new File(dataDir));
+        }
+        if (lastVersion != currentVersion) {
+            mWebViewPrefs.edit().putInt(VERSION_CODE_PREF, currentVersion).apply();
+        }
+        // Now safe to use WebView data directory.
+    }
+
+    private static boolean isBuildDebuggable() {
+        return !Build.TYPE.equals("user");
+    }
+
+    private static void deleteContents(File dir) {
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    deleteContents(file);
+                }
+                if (!file.delete()) {
+                    Log.w(TAG, "Failed to delete " + file);
+                }
+            }
+        }
     }
 
     private void initPlatSupportLibrary() {
         DrawGLFunctor.setChromiumAwDrawGLFunction(AwContents.getAwDrawGLFunction());
         AwContents.setAwDrawSWFunctionTable(GraphicsUtils.getDrawSWFunctionTable());
         AwContents.setAwDrawGLFunctionTable(GraphicsUtils.getDrawGLFunctionTable());
+    }
+
+    private static void initTraceEvent() {
+        syncATraceState();
+        SystemProperties.addChangeCallback(new Runnable() {
+            @Override
+            public void run() {
+                syncATraceState();
+            }
+        });
+    }
+
+    private static void syncATraceState() {
+        long enabledFlags = SystemProperties.getLong("debug.atrace.tags.enableflags", 0);
+        TraceEvent.setATraceEnabled((enabledFlags & Trace.TRACE_TAG_WEBVIEW) != 0);
     }
 
     private void ensureChromiumStartedLocked(boolean onMainThread) {
@@ -151,7 +211,7 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
         });
         while (!mStarted) {
             try {
-                // Important: wait() releases |mLock| so the UI thread can take it :-)
+                // Important: wait() releases |mLock| the UI thread can take it :-)
                 mLock.wait();
             } catch (InterruptedException e) {
                 // Keep trying... eventually the UI thread will process the task we sent it.
@@ -191,12 +251,14 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
 
         // Make sure that ResourceProvider is initialized before starting the browser process.
         setUpResources(ActivityThread.currentApplication());
-        AwBrowserProcess.start(getWrappedCurrentApplicationContext());
         initPlatSupportLibrary();
+        AwBrowserProcess.start(ActivityThread.currentApplication());
 
         if (Build.IS_DEBUGGABLE) {
             setWebContentsDebuggingEnabled(true);
         }
+
+        initTraceEvent();
         mStarted = true;
 
         for (WeakReference<WebViewChromium> wvc : mWebViewsToStart) {
@@ -220,10 +282,6 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
         }
     }
 
-    private Context getWrappedCurrentApplicationContext() {
-        return ResourcesContextWrapperFactory.get(ActivityThread.currentApplication());
-    }
-
     AwBrowserContext getBrowserContext() {
         synchronized (mLock) {
             return getBrowserContextLocked();
@@ -234,9 +292,7 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
         assert Thread.holdsLock(mLock);
         assert mStarted;
         if (mBrowserContext == null) {
-            mBrowserContext = new AwBrowserContext(
-                    ActivityThread.currentApplication().getSharedPreferences(
-                            CHROMIUM_PREFS_NAME, Context.MODE_PRIVATE));
+            mBrowserContext = new AwBrowserContext(mWebViewPrefs);
         }
         return mBrowserContext;
     }
@@ -253,21 +309,14 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
         mDevToolsServer.setRemoteDebuggingEnabled(enable);
     }
 
-    public static Resources getWebViewPackageResources(Context ctx) {
-        try {
-            return ctx.getPackageManager().getResourcesForApplication(
-                    WebViewFactory.getWebViewPackageName());
-        } catch (PackageManager.NameNotFoundException e) {
-            throw new RuntimeException("Could not load webview resources apk.", e);
-        }
-    }
-
     private void setUpResources(Context ctx) {
-        AwResource.setResources(getWebViewPackageResources(ctx));
-        AwResource.setErrorPageResources(R.raw.webviewchromium_loaderror,
-                R.raw.webviewchromium_nodomain);
+        ResourceRewriter.rewriteRValues(ctx);
+
+        AwResource.setResources(ctx.getResources());
+        AwResource.setErrorPageResources(android.R.raw.loaderror,
+                android.R.raw.nodomain);
         AwResource.setConfigKeySystemUuidMapping(
-                R.array.config_keySystemUuidMapping);
+                android.R.array.config_keySystemUuidMapping);
     }
 
     @Override
@@ -285,11 +334,6 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
                     }
 
                     @Override
-                    public void setPlatformNotificationsEnabled(boolean enable) {
-                        // noop
-                    }
-
-                    @Override
                     public String getDefaultUserAgent(Context context) {
                         return AwSettings.getDefaultUserAgent();
                     }
@@ -303,11 +347,28 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
                         }
                     }
 
+                    // TODO enable after L release to AOSP
+                    //@Override
+                    public void clearClientCertPreferences(Runnable onCleared) {
+                        AwContentsStatics.clearClientCertPreferences(onCleared);
+                    }
+
+                    @Override
                     public void freeMemoryForTests() {
                         if (ActivityManager.isRunningInTestHarness()) {
                             MemoryPressureListener.maybeNotifyMemoryPresure(
                                     ComponentCallbacks2.TRIM_MEMORY_COMPLETE);
                         }
+                    }
+
+                    // TODO: Add @Override.
+                    public void enableSlowWholeDocumentDraw() {
+                        WebViewChromium.enableSlowWholeDocumentDraw();
+                    }
+
+                    @Override
+                    public Uri[] parseFileChooserResult(int resultCode, Intent intent) {
+                        return FileChooserParamsAdapter.parseFileChooserResult(resultCode, intent);
                     }
                 };
             }
@@ -324,6 +385,7 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
                 mWebViewsToStart.add(new WeakReference<WebViewChromium>(wvc));
             }
         }
+
         return wvc;
     }
 
@@ -348,7 +410,7 @@ public class WebViewChromiumFactoryProvider implements WebViewFactoryProvider {
                     // will bring up just the parts it needs to make this work on a temporary
                     // basis until Chromium is started for real. The temporary cookie manager
                     // needs the application context to have been set.
-                    ContentMain.initApplicationContext(getWrappedCurrentApplicationContext());
+                    ContentMain.initApplicationContext(ActivityThread.currentApplication());
                 }
                 mCookieManager = new CookieManagerAdapter(new AwCookieManager());
             }
