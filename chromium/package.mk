@@ -37,7 +37,8 @@ LOCAL_MODULE_TAGS := optional
 
 LOCAL_STATIC_JAVA_LIBRARIES += android_webview_java_with_new_resources
 
-LOCAL_SRC_FILES := $(call all-java-files-under, java)
+LOCAL_SRC_FILES := $(call all-java-files-under, \
+                     ../../../$(CHROMIUM_PATH)/android_webview/glue/java/src)
 LOCAL_SRC_FILES += $(extra_java_files)
 
 LOCAL_JARJAR_RULES := $(CHROMIUM_PATH)/android_webview/build/jarjar-rules.txt
@@ -45,7 +46,6 @@ LOCAL_JARJAR_RULES := $(CHROMIUM_PATH)/android_webview/build/jarjar-rules.txt
 include $(CHROMIUM_PATH)/android_webview/build/resources_config.mk
 LOCAL_RESOURCE_DIR := \
     $(res_overrides) \
-    $(LOCAL_PATH)/res \
     $(android_webview_resources_dirs)
 
 LOCAL_AAPT_FLAGS := $(android_webview_aapt_flags)
