@@ -38,7 +38,7 @@ namespace {
 
 class PixelInfo : public AwPixelInfo {
  public:
-  PixelInfo(SkCanvas* canvas);
+  explicit PixelInfo(SkCanvas* canvas);
   ~PixelInfo();
 };
 
