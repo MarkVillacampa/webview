@@ -40,7 +40,7 @@ AwDrawGLFunction* g_aw_drawgl_function = NULL;
 
 class DrawGLFunctor : public Functor {
  public:
-  DrawGLFunctor(jlong view_context) : view_context_(view_context) {}
+  explicit DrawGLFunctor(jlong view_context) : view_context_(view_context) {}
   virtual ~DrawGLFunctor() {}
 
   // Functor
