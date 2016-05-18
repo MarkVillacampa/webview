@@ -31,7 +31,7 @@
 #include <utils/Log.h>
 
 #define NELEM(x) ((int) (sizeof(x) / sizeof((x)[0])))
-#define COMPILE_ASSERT(expr, err) static const char err[(expr) ? 1 : -1] = "";
+#define COMPILE_ASSERT(expr, err) static const char (err)[(expr) ? 1 : -1] = "";
 
 namespace android {
 namespace {
