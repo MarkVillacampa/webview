@@ -191,7 +191,9 @@ jint LoadWithRelroFile(JNIEnv* env, jclass, jstring lib32, jstring lib64,
   return ret;
 }
 
-const char kClassName[] = "android/webkit/WebViewFactory";
+const char kWebViewFactoryClassName[] = "android/webkit/WebViewFactory";
+const char kWebViewLibraryLoaderClassName[] =
+    "android/webkit/WebViewLibraryLoader";
 const JNINativeMethod kJniMethods[] = {
   { "nativeReserveAddressSpace", "(J)Z",
       reinterpret_cast<void*>(ReserveAddressSpace) },
@@ -208,10 +210,8 @@ const JNINativeMethod kJniMethods[] = {
 void RegisterWebViewFactory(JNIEnv* env) {
   // If either of these fail, it will set an exception that will be thrown on
   // return, so no need to handle errors here.
-  jclass clazz = env->FindClass(kClassName);
+  jclass clazz = env->FindClass(kWebViewFactoryClassName);
   if (clazz) {
-    env->RegisterNatives(clazz, kJniMethods, NELEM(kJniMethods));
-
     LIBLOAD_SUCCESS = env->GetStaticIntField(
         clazz,
         env->GetStaticFieldID(clazz, "LIBLOAD_SUCCESS", "I"));
@@ -234,6 +234,15 @@ void RegisterWebViewFactory(JNIEnv* env) {
   }
 }
 
+void RegisterWebViewLibraryLoader(JNIEnv* env) {
+  // If either of these fail, it will set an exception that will be thrown on
+  // return, so no need to handle errors here.
+  jclass clazz = env->FindClass(kWebViewLibraryLoaderClassName);
+  if (clazz) {
+    env->RegisterNatives(clazz, kJniMethods, NELEM(kJniMethods));
+  }
+}
+
 }  // namespace android
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
@@ -243,5 +252,10 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     return JNI_ERR;
   }
   android::RegisterWebViewFactory(env);
+  // Ensure there isn't a pending Java exception before registering methods from
+  // WebViewLibraryLoader
+  if (!env->ExceptionCheck()) {
+    android::RegisterWebViewLibraryLoader(env);
+  }
   return JNI_VERSION_1_6;
 }
